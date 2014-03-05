@@ -1,0 +1,690 @@
+\documentclass[a4paper,11pt,DIV=12]{scrartcl}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\setlength{\parindent}{0pt}
+
+
+\title{OpenLDAP in High Availability Environments on SLE12}
+\author{Peter Varkoly, \href{mailto:varkoly@suse.com}{varkoly@suse.com}}
+\date{Februar 2014}
+\begin{document}
+\maketitle
+\begin{abstract}
+    LDAP Directories are a central part in the IT infrastructure of a lot of
+    organizations. Commonly many services in the organization rely on the
+    availability of the Directory. Because of this unexpected outages or
+    downtimes of the Directory Service can be very expensive and have to be kept
+    to a minimum. There are several ways to increase the Availability of the
+    Directory Service. This paper will highlight one of those ways by outlining
+    a setup of software from various open source projects to create a high
+    availability failover cluster of OpenLDAP servers.
+\end{abstract}
+
+\section{Failover Clusters: A brief introduction}
+    Failover clusters are central in most HA solutions. A failover setup
+    consists of two or more redundant computers (also referred to as "nodes").
+    If one of the nodes fails, applications can be migrated ("failed
+    over") to another node.
+    In order to allow automatic failover a Cluster Management Software
+    is running on the cluster. It has the following tasks to accomplish:
+
+    \begin{description}
+        \item [Membership:]
+            Establish which nodes are currently part (member) of the cluster.
+            Make sure that only authorized nodes are able to become a member
+            of the cluster.
+        \item [Messaging:]
+            A working communication channel between all nodes is essential for
+            the cluster. Through this channel the nodes can monitor each other
+            and see if the cluster is still healthy.  If the communication
+            channel between one or more nodes of the cluster is lost the
+            cluster becomes partitioned (also known as a \emph{split-brain}
+            condition), it is important that only one of the remaining
+            partitions (sub-clusters) continues providing service.  This can
+            be determined through a vote of all remaining nodes. The
+            partition that has more than half of the total possible votes will
+            form a new cluster (it is said to have \emph{quorum}). As the new
+            formed cluster usually cannot determine if the partitioned nodes
+            are dead or if it is just a communication problem between the nodes
+            another important concept of HA clusters comes into place: Fencing.
+        \item [Fencing:]
+            The goal of fencing is to avoid damage by preventing a
+            (non-quorum) sub-cluster from accessing resources of the cluster.
+            There are two different kinds of fencing:
+            \begin{description}
+                \item [Resource fencing:]
+                    Keep the fenced node from accessing the resources it might
+                    be trying to access. E.g. by reconfiguring switches to deny
+                    access for that specific node.
+                \item [Node fencing:]
+                    Keep the fenced node from accessing any resource. Most
+                    easily implemented by resetting or powering off the node.
+                    This technique is also referred to as STONITH ("Shoot the
+                    other node in the Head")
+            \end{description}
+        \item [Resources:]
+            Any type of application or service that is known to the cluster is
+            called a resource. Resources can be a particular IP address, a
+            database or an LDAP Server. The cluster management software is
+            responsible for starting, stopping and monitoring the resources.
+    \end{description}
+
+\section{Failover Clusters on Linux}
+    When setting up a Failover Cluster on Linux usually Pacemaker is used.
+    Pacemaker provides an Open Source High Availability Cluster
+    Resource Manager.
+
+\subsection{Pacemaker Architecture}
+    From a very high level view a Pacemaker cluster is made up of these
+    components:
+    \begin{description}
+        \item[Membership and Communication:]
+            Pacemaker can make use of different frameworks for communication
+            and membership. This document only covers the Corosync
+            Engine\footnote{http://www.corosync.org}.
+        \item[Cluster Resource Management Daemon (CRMd)]
+            \verb|crmd| is the central daemon of the cluster coordinating all
+            other subsystems.
+        \item[Cluster Information Base (CIB):]
+            Represents (in XML) the configuration and the current state of all
+            resources in the cluster. The CIB is automatically synchronized
+            across all cluster members.
+        \item[Policy Engine (PEngine):]
+            Uses the information from the CIB to make decision about resource
+            management actions (e.g. which resources to start/stop on which
+            nodes of the cluster).
+        \item[Local Resource Manager (LRM):]
+            Responsible for managing the resources on a single node by invoking
+            the respective resource agents.
+        \item[Resource agents:] They provide an abstract interface for the
+            LRM to a specific resource (e.g. the OpenLDAP server) to give the
+            cluster a consistent view on the resources.
+            By that the cluster does not need to understand how exactly a
+            resource works and can rely on the agent to do the right thing when
+            it issues a \verb|start|, \verb|stop| or \verb|monitor| action.
+            Typically resource agents are written as normal shell scripts and
+            are in many regards very similar to System V init scripts.
+        \item[STONITHd:]
+            Pacemaker's fencing subsystem.
+        \item[Management tools:]
+            Pacemaker come with a set of command line and GUI tools to
+            manage and monitor the cluster and its resources.
+    \end{description}
+
+\subsection{Resources}
+    As already mentioned all services/application that are managed by the
+    cluster are called Resources. Pacemaker knows a few different types of
+    resources:
+    \begin{description}
+        \item[Primitive:]
+            The most basic type of a resource, representing a single service.
+        \item[Group:]
+            A group is made of a set of primitive resources. Groups can be
+            used to define certain dependencies that exists between the
+            members of the group. E.g. the members need to be started in a
+            specific order, or all group members need to run on the same node.
+        \item[Clone:]
+            Clones are use to setup resources that need to run on multiple
+            nodes at the same time. Clones can be created from a Group or
+            a Primitive.
+        \item[Master:]
+            A master resource is a specialization of a clone resource. It is
+            used to represent resource that can operate in different modes
+            (master or slave).
+    \end{description}
+
+\section{A Failover setup for OpenLDAP}
+    The following sections introduce an example setup for a High Available
+    OpenLDAP Service. It is a two-node setup where both nodes are running
+    OpenLDAP using \emph{MirrorMode} replication to keep the LDAP Data and
+    Configuration synchronized.  \emph{MirrorMode} is a hybrid
+    replication setup that provides all of the consistency guarantees of
+    single-master replication, while also allowing to provide the high
+    availability of multi-master\cite{adming}. For successful operation
+    \emph{MirrorMode} requires an external (to OpenLDAP) mechanism to ensure
+    that LDAP write operations are only directed to one of the participating
+    nodes. The setup introduced here uses a virtual IP address managed by
+    Pacemaker to achieve this goal. The image below gives an overview about the
+    components used in the setup. As illustrated there Pacemaker is also used
+    to manage OpenLDAP (to start, stop and monitor) and to handle fencing
+    (through STONITH).
+
+    \begin{center}
+        \includegraphics[scale=0.42]{mm-cluster-overview}
+    \end{center}
+
+\subsection{Preparations}
+
+\paragraph{Network Configuration}
+    Each node in the cluster has two separate network interfaces. One is
+    purely used for the cluster's internal communication (LDAP replication
+    traffic and internal communication of the different cluster components).
+    The other one is used for the external traffic, i.e. mainly the LDAP
+    clients accessing the LDAP service. In this setup the cluster internal
+    interfaces will use IP Addresses from the \verb|192.168.100.0/24| subnet
+    while the external/public interfaces are on the  \verb|192.168.101.0/24|
+    network.
+
+    It is important that every node is able to resolve the hostnames of all
+    participating nodes to the correct IP Addresses. Either by setting up
+    DNS or by adding the required entries to the /etc/hosts file.
+
+    Communication is essential to clusters. It is highly recommended that the
+    communication paths between nodes are redundant, either by bonding the
+    interfaces or by deploying the corosync Redundant Ring Protocol (RRP).
+
+\paragraph{Time Synchronization}
+    For MirrorMode Replication to work accurately it is important that the
+    system clocks on the participating nodes are tightly in sync. So it is
+    recommended to setup NTP to synchronize the clocks of all nodes.
+
+\paragraph{Certificates}
+    To have TLS encryption work as seamless as possible for the clients,
+    special care has to be taken when creating the server certificates. The
+    easiest setup probably is to create a single certificate for the whole
+    cluster that is copied to
+    both nodes. That certificate would need to have the names (and/or IP
+    Addresses) of the internal and external interfaces of all participating
+    nodes present in its \verb|Subject| \verb|Alt| \verb|Name| Attribute,
+    including the Virtual IP-Address and Name under which the server will be
+    contacted by the clients.
+
+    Before describing the details of the Pacemaker setup we will now continue
+    to layout the steps required to create an OpenLDAP MirrorMode
+    configuration.
+
+\subsection{OpenLDAP MirrorMode Configuration}
+    As OpenLDAP is able to replicate its own configuration
+    database (\verb|cn=config|) via SyncRepl the example setup will make
+    use of this feature. Even though it is not strictly required for a
+    MirrorMode setup, it will make configuration changes in the running cluster
+    easier. The LDIF examples following in the next sections assume that slapd
+    is already running on the nodes in a basic setup with a single
+    \verb|hdb| database serving the \verb|dc=example,dc=com| subtree.
+
+\paragraph{Syncrepl Account}
+    As the first step we create a new account object that is later used for
+    authenticating the syncrepl consumer connections between the two nodes.
+    This account must be created only on one of the nodes. Once the replication
+    is configured, this account will be syncronized to all \verb|slapd| instances.
+    \begin{verbatim}
+dn: uid=syncrepl,dc=example,dc=com
+objectclass: account
+objectclass: simpleSecurityObject
+userPassword: {SSHA}ib8NBYz/pJVrpm/KKtjOQEJFzYVAPbxE
+    \end{verbatim}
+
+    The following changes must be made on all nodes.
+
+    This account needs to have read access to every LDAP entry that is going to
+    be replicated. So ACLs and Limits might need to be adjusted accordingly:
+    \begin{verbatim}
+dn: olcDatabase={0}config,cn=config
+add: olcLimits
+olcLimits: dn.exact="uid=syncrepl,dc=example,dc=com"
+  size=unlimited
+-
+add: olcAccess
+olcAccess: {0}to *
+  by dn.exact="uid=syncrepl,dc=example,dc=com" read
+  by * break
+
+dn: olcDatabase={1}hdb,cn=config
+add: olcLimits
+olcLimits: dn.exact="uid=syncrepl,dc=example,dc=com"
+  size=unlimited
+-
+add: olcAccess
+olcAccess: {0}to *
+  by dn.exact="uid=syncrepl,dc=example,dc=com" read
+  by * break
+    \end{verbatim}
+
+\paragraph{Server ID}
+    One major difference between the nodes in a MirrorMode setup and a normal
+    syncrepl provider in master-slave Replication is the definition of the
+    \verb|olcServerId| attribute. Every node needs to have a unique
+    server ID mapped to its hostname. The following LDIF is used with
+    \verb|ldapmodify| to add the Server IDs for the two node setup.
+
+    For \verb|node1|:
+    \begin{verbatim}
+dn: cn=config
+add: olcServerId
+olcServerId: 1
+    \end{verbatim}
+
+    For \verb|node2|:
+    \begin{verbatim}
+dn: cn=config
+add: olcServerId
+olcServerId: 2
+    \end{verbatim}
+
+\paragraph{LDAPSync Replication Provider}
+    Every replicated database needs to have the SyncRepl provider overlay
+    (\verb|syncprov|) loaded. In LDIF for usage with \verb|ldapadd|:
+
+    \begin{verbatim}
+dn: olcOverlay=syncprov,olcDatabase={0}config,cn=config
+objectclass: olcSyncprovConfig
+olcSpCheckpoint: 100 5
+
+dn: olcOverlay=syncprov,olcDatabase={1}hdb,cn=config
+objectclass: olcSyncprovConfig
+olcSpCheckpoint: 100 5
+    \end{verbatim}
+
+\paragraph{LDAPSync Replication Consumer}
+    The next step is to add the consumer configurations to the database. Note
+    that each database will have multiple \verb|olcSyncrepl| attributes
+    pointing to all MirrorMode Nodes. Including one \verb|olcSyncrepl| value
+    pointing to itself. The SyncRepl client in \verb|slapd| is smart enough to
+    just ignore that one.
+    \begin{verbatim}
+dn: olcDatabase={0}config,cn=config
+add: olcSyncrepl
+olcSyncrepl: rid=001
+  provider="ldap://<node1>"
+  searchbase="cn=config"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="critical"
+  tls_reqcert="demand"
+olcSyncrepl: rid=002
+  provider="ldap://<node2>"
+  searchbase="cn=config"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="critical"
+  tls_reqcert="demand"
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+-
+add: olcDbIndex
+olcDbIndex: entryCSN eq
+olcDbIndex: entryUUID eq
+
+dn: olcDatabase={1}hdb,cn=config
+add: olcSyncrepl
+olcSyncrepl: rid=003
+  provider="ldap://node1"
+  searchbase="dc=example,dc=com"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="no"
+olcSyncrepl: rid=004
+  provider="ldap://node2"
+  searchbase="dc=example,dc=com"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="no"
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+-
+add: olcDbIndex
+olcDbIndex: entryCSN eq
+olcDbIndex: entryUUID eq
+    \end{verbatim}
+
+\subsection{Second Node}
+    Make sure that the Server Certificate and CA files are installed in the
+    correct place on both nodes and that the user running slapd has sufficient
+    access to them. After that \verb|slapd| can be started on the second node.
+    It should automatically start replicating the \verb|hdb| database from the
+    first node. The basic MirrorMode setup is now completed.
+
+    The remaining sections will describe how that setup is now integrated into
+    a Pacemaker cluster. Before continuing it is important to stop slapd and to
+    disable any init-scripts that would start it again automatically at
+    boot-time.  Starting and stopping slapd will later be handled by the
+    cluster stack.
+
+\section{Pacemaker/Corosync Setup}
+
+\subsection{Required Software}
+    At least the following software components need to be installed for the
+    example setup:
+    \begin{itemize}
+        \item PaceMaker
+        \item Resource Agents
+        \item CoroSync
+        \item ClusterGlue
+    \end{itemize}
+    SUSE offers the \emph{High Availability Extensions} Addon for
+    \emph{SUSE Linux Enterprise Server 11}
+    \footnote{\url{http://www.suse.com/products/highavailability/}}. All
+    of the above mentioned components are part of that product and the
+    configuration examples  throughout the following section are based on
+    that product.
+    Prebuilt packages of the required components are also available for various
+    other Distributions
+    \footnote{\url{http://www.clusterlabs.org/wiki/Install}}.
+
+\subsection{Basic Setup}
+    The main  configuration is stored in \verb|/etc/corosync/corosync.conf|.
+    It is divided into multiple sections. The \verb|totem| section contains
+    setup for the communication channels used by the cluster nodes.  Each
+    communication channel is defined in a separate \verb|interface| subsection
+    inside that section. As Corosync uses multicast for communication a
+    port number and multicast address for use by the cluster is defined. The
+    example below uses \verb|226.94.1.1| as the multicast address and the port
+    number \verb|5405|.  Additionally the network address of the interface to
+    use for cluster communication needs to be defined
+    (here: \verb|192.168.100.0|).
+    \begin{verbatim}
+totem {
+        version:        2
+        crypto_cipher: none
+        crypto_hash: none
+        clear_node_high_bit: yes
+        interface {
+                ringnumber: 0
+                bindnetaddr: 192.168.100.0
+                mcastaddr: 226.94.1.1
+                mcastport: 5405
+                ttl: 1
+        }
+}
+
+logging {
+        to_stderr: no
+        to_logfile: yes
+        logfile: /var/log/cluster/corosync.log
+        to_syslog: yes
+        debug: off
+        timestamp: on
+        logger_subsys {
+                subsys: QUORUM
+                debug: off
+        }
+}
+
+quorum {
+        provider: corosync_votequorum
+        expected_votes: 2
+}
+
+    \end{verbatim}
+
+
+    For encrypted cluster communication a shared key needs to be generated 
+    and the parameters \verb|crypto_cipher| and \verb|crypto_hash| must be
+    enabled in the configuration.
+    The \verb|corosync-keygen| command is used for generating the shared key.
+    The key will end up in \verb|/etc/corosync/authkey|. This file together with
+    \verb|corosync.conf| should be copied over to the second cluster node.
+    (Hint: In larger clusters a tool like
+    \verb|csync2|\footnote{\url{http://oss.linbit.com/csync2/}} can be used
+    for distributing the configuration.)
+
+\subsubsection{Starting and Verifying the Configuration}
+    The cluster software can now be started to verify the configuration. On
+    SUSE Linux Enterprise it is done by running this commands on every node:
+    \begin{verbatim}
+systemctl enable corosync.service
+systemctl enable pacemaker.service
+systemctl start corosync.service
+systemctl start pacemaker.servic
+    \end{verbatim}
+    To check the cluster status now the \verb|crm_mon| command is used.
+    If all nodes are online the output should be similar to this:
+    \begin{verbatim}
+============
+Last updated: Mon Sep 26 13:50:22 2011
+Last change: Mon Sep 26 12:10:52 2011 by hacluster via crmd on node1
+Stack: openais
+Current DC: node1 - partition with quorum
+Version: 1.1.6-9971ebba4494012a93c03b40a2c58ec0eb60f50c
+2 Nodes configured, 2 expected votes
+0 Resources configured.
+============
+
+Online: [ node1 node2 ]
+    \end{verbatim}
+
+    After these basic configuration steps are done we can now start to setup
+    the cluster resources.
+
+\subsection{Resources}
+    As already mentioned the cluster configuration is done either via the
+    command line interface \verb|crm| or the GUI interface \verb|crm_gui|. This
+    paper will focus on the command line tool. The tool offers a set of
+    subcommands to manage the cluster configuration. Use \verb|crm help| to get
+    an overview of all the supported subcommands. The \verb|crm| command can
+    also be used as an interactive shell including tab completion and command
+    history.  For that just execute \verb|crm| without any arguments. To leave
+    the shell use the commands \verb|quit|, \verb|bye| or \verb|exit|.
+
+    The first step is now to define what to do when the
+    cluster has no quorum. As we are setting up a two node cluster, quorum is
+    always lost when a single node is failing. So we configure the cluster to
+    continue "normal" operations when quorum is lost.  This is done by setting
+    the global property \verb|no-quorum-policy| to \verb|ignore|.
+    \begin{verbatim}
+node1:~ # crm configure property no-quorum-policy=ignore
+    \end{verbatim}
+
+    The \verb|crm| tool offers the \verb|ra| subcommand to get information
+    about the available resource agents. Pacemaker supports different classes
+    of resource agents implementing different standard interfaces. To get a
+    list of the resource agent classes use the command:
+    \begin{verbatim}
+node1:~ # crm ra classes
+heartbeat
+lsb
+ocf / heartbeat pacemaker
+stonith
+    \end{verbatim}
+    To get a list of all available resource agents for a class use the list
+    command:
+    \begin{verbatim}
+node1:~ # crm ra list ocf
+AoEtarget           AudibleAlarm        CTDB
+[..]
+tomcat              vmware
+    \end{verbatim}
+
+    To display detailed documentation about a resource agent and required
+    parameters use the info subcommand:
+    \begin{verbatim}
+node1:~ # crm ra info ocf:heartbeat:IPaddr2
+    \end{verbatim}
+
+\subsubsection{Fencing}
+    In Pacemaker node level fencing is implemented with the agents of the
+    \verb|stonith| class. As the example setup is running on virtual machines
+    the \verb|external/libvirt| STONITH agent is used. In a production setup on
+    real hardware usually some kind of remote power switch is used for the
+    STONITH resource.
+
+    The  \verb|external/libvirt| agent accesses the virtualization host's
+    management daemon \verb|libvirtd| to reset the node that is supposed to be
+    fenced. It requires the following parameters:
+
+    \begin{description}
+        \item[hostlist:] A list of \verb|hostname:domain_id| tuples of the
+            controlled nodes. The \verb|domain_id| can be omitted if it
+            matches the hostname.
+        \item[hypervisor\_uri:] URI for connection to libvirtd. E.g.
+               \verb|qemu+ssh://kvm.site/system| for access via ssh.
+    \end{description}
+
+    To use this agent \verb|virsh| must be installed on the node (part of the
+    libvirt-client package on SLES) and access control on the hypervisor must
+    be configured to give sufficient privileges for the selected URI. To add
+    the STONITH configuration as a cloned resource, so that it is active on
+    every node, use:
+    \begin{verbatim}
+node1:~ # crm configure
+crm(live)configure# primitive st0 stonith:external/libvirt \
+              params hostlist="node1:node1 node2:node2" \
+              hypervisor_uri="qemu+ssh://192.168.101.1/system" \
+              op monitor interval=15s
+crm(live)configure# clone stonith st0
+crm(live)configure# commit
+    \end{verbatim}
+    This also configures the external/libvirt agent's monitor operation
+    to check connectivity to the hypervisor every 15 seconds.
+
+\subsubsection{OpenLDAP Resource Agent}
+    Up to now there is no working pre-packaged resource agent for OpenLDAP
+    available. There is however one in review on the linux-ha developers
+    mailing list
+    currently\footnote{\url{https://github.com/jhohm/resource-agents/blob/master/heartbeat/slapd}}
+    which works reasonably well already. To be used it needs to be
+    installed in the \verb|/usr/lib/ocf/resource.d/heartbeat/| directory.
+    Use \verb|crm ra info ocf:heartbeat:slapd| to display detailed information
+    about all it supported parameters. To configure with the \verb|crm|
+    interactive shell use:
+    \begin{verbatim}
+node1:~ # crm configure
+crm(live)configure# primitive slapd_mirrormode ocf:heartbeat:slapd params\
+                        slapd="/usr/lib/openldap/slapd" \
+                        config="/etc/openldap/slapd.d/" \
+                        user="ldap" group="ldap" \
+                        services="ldap:/// ldaps:/// ldapi:///" \
+                        watch_suffix="dc=example,dc=com" \
+                        meta migration-threshold="3" \
+                        op monitor interval=10s
+    \end{verbatim}
+
+    This sets up a primitive resource named \verb|slapd_mirrormode|
+    the using the parameters:
+    \begin{description}
+        \item[slapd:]
+            Contains the path to the \verb|slapd| binary
+        \item[config:]
+            Contains the path to either the \verb|slapd.conf| configuration
+            file or the directory which is used of the \verb|cn=config|
+            database.
+        \item[user/group:]
+            User/Group which slapd should run as. (Passed to slapd's \verb|-u|
+            \verb|-g| arguments.
+        \item[services:]
+            Defines which interfaces slapd should listen on (Passed to slapd's
+            \verb|-h| argument.
+        \item[watch\_suffix:]
+            The suffix of the database(s) which the agent should monitor for
+            availability. (Multiple suffixes are possible, it is also possible
+            to configure bind-credentials to use an authenticated connection for
+            for monitoring, see the agent's documentation for details)
+    \end{description}
+    The meta Attribute \verb|migration-threshold| is set to \verb|3| for this
+    resource. This means that pacemaker will try to start/restart
+    the resource 3 times before it stops trying to run the resource on a
+    specific node.
+
+    The monitor operation of the slapd agent is configured to run every 10
+    seconds.
+
+    Now we tell crm to setup the \verb|slapd_mirrormode| primitive as
+    a cloned resource to have it running on all nodes and activate the
+    configuration using the \verb|commit| command.
+    \begin{verbatim}
+crm(live)configure# clone ldap_clone slapd_mirrormode
+crm(live)configure# commit
+    \end{verbatim}
+
+    If everything went right \verb|slapd| should be running on both nodes
+    in the cluster now. Use \verb|crm_mon| to verify that. Its output should
+    contain something like:
+    \begin{verbatim}
+Clone Set: ldap_clone [slapd_mirrormode]
+  Started: [ node2 node1 ]
+    \end{verbatim}
+
+\subsubsection{Virtual IP}
+    The \verb|IPaddr2| resource agent is used to set the Virtual IP Address.
+    The monitoring interval is set to 5 seconds:
+    \begin{verbatim}
+crm(live)configure# primitive ldap-v_ip ocf:heartbeat:IPaddr2 \
+        params ip="192.168.101.200" nic="eth0" \
+        op monitor interval="5s" timeout="20s"
+    \end{verbatim}
+
+    We also need to define that the new \verb|ldap-v_ip| resource needs to
+    run together with one of the cloned slapd instances. This is done with
+    a colocation constraint:
+    \begin{verbatim}
+crm(live)configure# colocation v_ip_with_slapd inf: ldap-v_ip ldap_clone
+    \end{verbatim}
+
+    After that an order constraint is added to make sure that the Virtual IP
+    resource is always started before the \verb|ldap_clone| resource. Again
+    the \verb|commit| command is needed to activate the configuration.
+    \begin{verbatim}
+crm(live)configure# order ip_before_slapd inf: ldap-v_ip ldap_clone
+crm(live)configure# commit
+    \end{verbatim}
+
+\subsection{Testing and Monitoring}
+    The setup is now basically complete and ready for some testing. Monitoring
+    the current status of the cluster can be done with the \verb|crm_mon| tool.
+    For testing if the failover of the virtual IP address correctly works when
+    slapd crashes on the currently active node, you can for example kill the
+    slapd process on that node. Pacemaker will first try to
+    restart slapd. After slapd was killed for the third time, pacemaker should
+    re-assign the virtual IP address to the second node. After that the
+    \verb|slapd_mirrormode| resource should be shown as \verb|stopped| on the
+    failed node.
+
+    Further testing includes checking whether fencing is working correctly when
+    e.g. the communication channel between the cluster nodes is lost.
+
+\section{Possibilities for enhancing the Setup}
+    The setup introduced here is a very simple example of an HA cluster for
+    OpenLDAP. There are various options to enhance this. E.g. some additional
+    OpenLDAP nodes could be added acting as SyncRepl consumers of the MirrorMode
+    nodes. LDAP traffic could be load-balanced among these nodes leveraging e.g.
+    Linux Virtual Server (LVS). The SyncRepl consumer would be configured to
+    chain LDAP write operation to the virtual IP configured for the MirrorMode
+    nodes.
+
+\begin{thebibliography}{aa}
+    \bibitem{adming}
+        The OpenLDAP Project, {\it OpenLDAP Software 2.4 Administrator's Guide},
+        \url{http://www.openldap.org/doc/admin24/index.html}
+        2011
+    \bibitem{}
+        Beekhof, Andrew,
+        {\it Pacemaker 1.1 Configuration Explained},
+        \url{http://www.clusterlabs.org/doc/en-US/Pacemaker/1.1/pdf/Pacemaker_Explained/Pacemaker-1.1-Pacemaker_Explained-en-US.pdf},
+        2009
+    \bibitem{}Muhamedagic, Dejan,
+        {\it The road to high availability: solutions built on open source},
+        \linebreak
+        \url{http://www.linux-ha.org/wiki/File:Linuxtag-09-ha-paper.pdf},
+        2006
+    \bibitem{}
+        Novell Inc.,
+        {\it SUSE Linux Enterprise High Availability Extension,
+        High Availability Guide},
+        \url{http://www.suse.com/documentation/sle_ha/},
+        2011
+\end{thebibliography}
+
+\end{document}

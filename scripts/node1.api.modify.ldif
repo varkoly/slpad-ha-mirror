@@ -1,0 +1,82 @@
+dn: cn=config
+add: olcServerId
+olcServerId: 1
+
+dn: olcDatabase={0}config,cn=config
+add: olcLimits
+olcLimits: dn.exact="uid=syncrepl,dc=example,dc=com"
+  size=unlimited
+-
+add: olcAccess
+olcAccess: {0}to *
+  by dn.exact="uid=syncrepl,dc=example,dc=com" read
+  by * break
+-
+add: olcSyncrepl
+olcSyncrepl: rid=001
+  provider="ldap://node1"
+  searchbase="cn=config"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="no"
+olcSyncrepl: rid=002
+  provider="ldap://node2"
+  searchbase="cn=config"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="no"
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+
+dn: olcDatabase={1}hdb,cn=config
+add: olcLimits
+olcLimits: dn.exact="uid=syncrepl,dc=example,dc=com"
+  size=unlimited
+-
+add: olcAccess
+olcAccess: {0}to *
+  by dn.exact="uid=syncrepl,dc=example,dc=com" read
+  by * break
+-
+add: olcDbIndex
+olcDbIndex: entryCSN eq
+olcDbIndex: entryUUID eq
+-
+add: olcSyncrepl
+olcSyncrepl: rid=003
+  provider="ldap://node1"
+  searchbase="dc=example,dc=com"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="no"
+olcSyncrepl: rid=004
+  provider="ldap://node2"
+  searchbase="dc=example,dc=com"
+  type=refreshAndPersist
+  bindmethod=simple
+  binddn="uid=syncrepl,dc=example,dc=com"
+  credentials="secret"
+  retry="30 +"
+  network-timeout=5
+  timeout=30
+  starttls="no"
+-
+add: olcMirrorMode
+olcMirrorMode: TRUE
+

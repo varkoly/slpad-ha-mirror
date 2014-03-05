@@ -1,0 +1,6 @@
+dn: uid=syncrepl,dc=example,dc=com
+objectclass: account
+objectclass: simpleSecurityObject
+userPassword: secret
+
+
